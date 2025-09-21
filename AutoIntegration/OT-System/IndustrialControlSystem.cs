@@ -2,6 +2,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -12,6 +13,8 @@ namespace OT_System
     {
         private static volatile bool isBusy = false;
         private static readonly object _lock = new();
+        private const short AuthKey = unchecked((short)0xBEEF);
+        private static short lastNonce = 0;
 
         public void Run()
         {
@@ -34,6 +37,7 @@ namespace OT_System
             // Event for when Coils (Digital Outputs) are written to by a client
             modbusServer.CoilsChanged += (int startAddress, int numberOfCoils) =>
             {
+
                 Console.WriteLine($"CoilsChanged at {DateTime.Now}");
                 Console.WriteLine($"  Start Address: {startAddress}");
                 Console.WriteLine($"  Number of Coils: {numberOfCoils}");
@@ -49,7 +53,7 @@ namespace OT_System
                 }
 
                 // Start job when coil[0] is true
-                if (modbusServer.coils[0])
+                if (modbusServer.coils[0] || modbusServer.coils[1])
                 {
                     lock (_lock)
                     {
@@ -57,15 +61,42 @@ namespace OT_System
                         isBusy = true;
                     }
 
-                    int orderId = modbusServer.holdingRegisters[0];
-                    int qty = modbusServer.holdingRegisters[1];
+                    short key = (short)(modbusServer.holdingRegisters[10] != 0
+                        ? modbusServer.holdingRegisters[10]
+                        : modbusServer.holdingRegisters[11]);
+                    short nonce = (short)(modbusServer.holdingRegisters[11] != 0
+                        ? modbusServer.holdingRegisters[11]
+                        : modbusServer.holdingRegisters[12]);
+
+                    if (key != AuthKey || nonce == lastNonce)
+                    {
+                        Console.WriteLine("!! Unauthorized or replay start ignored");
+                        modbusServer.coils[0] = false;
+                        modbusServer.coils[1] = false;
+                        lock (_lock) isBusy = false;
+                        return;
+                    }
+                    lastNonce = nonce;
+
+                    // Read from 0 or 1 based addresses depending on what client wrote
+                    int orderId = modbusServer.holdingRegisters[0] != 0
+                        ? modbusServer.holdingRegisters[0]
+                        : modbusServer.holdingRegisters[1];
+
+                    // Take quantity from HR[2] if it exists, otherwise HR[1]
+                    int qty = modbusServer.holdingRegisters[2] != 0
+                        ? modbusServer.holdingRegisters[2]
+                        : modbusServer.holdingRegisters[1];
+
                     if (qty < 0) qty = 0;
 
                     Console.WriteLine($"--> START order {orderId} (qty {qty})");
 
                     // Reset status
                     modbusServer.inputRegisters[0] = 0;
+                    modbusServer.inputRegisters[1] = 0;
                     modbusServer.discreteInputs[0] = false;
+                    modbusServer.discreteInputs[1] = false;
 
                     // Simulate production
                     new Thread(() =>
@@ -74,18 +105,20 @@ namespace OT_System
                         {
                             for (int n = 0; n < qty; n++)
                             {
-                                Thread.Sleep(500); // unit time
-                                // cast to 16-bit value
+                                Thread.Sleep(1000);
                                 short produced = (short)Math.Min(n + 1, short.MaxValue);
-                                modbusServer.inputRegisters[0] = produced; // progress
+                                modbusServer.inputRegisters[0] = produced;
+                                modbusServer.inputRegisters[1] = produced;
                             }
 
-                            modbusServer.discreteInputs[0] = true; // done
+                            modbusServer.discreteInputs[0] = true;
+                            modbusServer.discreteInputs[1] = true;
                             Console.WriteLine($"<-- DONE order {orderId} (produced {qty})");
                         }
                         finally
                         {
-                            modbusServer.coils[0] = false; // reset start coil
+                            modbusServer.coils[0] = false;
+                            modbusServer.coils[1] = false;
                             lock (_lock) isBusy = false;
                         }
                     }).Start();
@@ -111,7 +144,9 @@ namespace OT_System
 
             // Initial values
             modbusServer.inputRegisters[0] = 0;
+            modbusServer.inputRegisters[1] = 0;
             modbusServer.discreteInputs[0] = false;
+            modbusServer.discreteInputs[1] = false;
 
             try
             {

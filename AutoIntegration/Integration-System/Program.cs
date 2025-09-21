@@ -4,6 +4,8 @@ using Integration_System.Models;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 
+const short AuthKey = unchecked((short)0xBEEF);
+
 var cfg = new ConfigurationBuilder()
     .SetBasePath(AppContext.BaseDirectory)
     .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
@@ -58,13 +60,18 @@ while (true)
             client.WriteSingleRegister(0, orderId16);
             client.WriteSingleRegister(1, qty16);
 
+            short nonce = (short)Random.Shared.Next(1, short.MaxValue);
+            client.WriteSingleRegister(10, AuthKey);
+            client.WriteSingleRegister(11, nonce);
+
             // Start job: coil[0] = true
             client.WriteSingleCoil(0, true);
 
             order.Status = OrderStatus.InProgress;
             db.SaveChanges();
 
-            // Read progress (IR0) until it is done (DI0)
+            // Read progress (IR0) until done (DI0)
+            var lastChangeAt = DateTime.UtcNow;
             int last = -1;
             while (true)
             {
@@ -73,6 +80,8 @@ while (true)
                 if (produced != last)
                 {
                     last = produced;
+                    lastChangeAt = DateTime.UtcNow;
+
                     db.ProductionLogs.Add(new ProductionLog
                     {
                         OrderId = order.Id,
@@ -93,13 +102,21 @@ while (true)
                     break;
                 }
 
+                if ((DateTime.UtcNow - lastChangeAt).TotalSeconds > 20)
+                {
+                    order.Status = OrderStatus.Failed;
+                    order.LastError = "No progress from OT (timeout)";
+                    db.SaveChanges();
+                    Console.WriteLine($"Order #{order.Id} failed (timeout).");
+                    break;
+                }
+
                 Thread.Sleep(poll * 1000);
             }
         }
         finally
         {
-            // Close connection if it is open
-            try { if (client != null && client.Connected) client.Disconnect(); } catch {}
+            try { if (client != null && client.Connected) client.Disconnect(); } catch { }
         }
     }
     catch (Exception ex)
